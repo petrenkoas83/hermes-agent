@@ -581,8 +581,12 @@ class EmailAdapter(BasePlatformAdapter):
                     # arrived during the outage stays eligible for the next poll.
                     self._seen_uids = set(snapshot)
                     passed = "[Email] IMAP reconnect test passed. Restored %d seen UIDs; messages received during the outage will be processed."
-                else:  # first connect (or no snapshot): mark all existing messages seen
-                    status, data = imap.uid("search", None, "ALL")
+                else:
+                    # First connect (or no snapshot): pre-populate the seen-UID baseline with
+                    # already-read (SEEN) messages only, so UNSEEN messages that arrived before
+                    # startup are still picked up by the first poll (the fetch searches UNSEEN and
+                    # skips UIDs already in this set).
+                    status, data = imap.uid("search", None, "SEEN")
                     self._seen_uids.update(data[0].split() if status == "OK" and data and data[0] else ())
                     passed = "[Email] IMAP connection test passed. %d existing messages skipped."
                 self._trim_seen_uids()
