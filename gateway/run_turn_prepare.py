@@ -217,6 +217,17 @@ class GatewayTurnPrepareMixin:
             return _resolve_policy_agent_runtime(self, policy, fallback=fallback, record_notice=record_notice)
         skey = self._resolve_session_key_or_none(source, session_key)
         model = _resolve_gateway_model(user_config)
+
+        # Per-platform model override (from model_platforms config). Applied before the session
+        # ``/model`` override so an explicit per-session choice still wins.
+        if source is not None and getattr(source, "platform", None) is not None:
+            platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+            model_platforms = (user_config or {}).get("model_platforms", {})
+            platform_model = model_platforms.get(platform_name) if isinstance(model_platforms, dict) else None
+            if platform_model and isinstance(platform_model, str) and platform_model.strip():
+                logger.info("[Model] Override for platform %s: %s -> %s", platform_name, model, platform_model.strip())
+                model = platform_model.strip()
+
         if skey:
             self._rehydrate_session_model_override(skey)
         _override_state = self._peek_session_state(skey) if skey else None
