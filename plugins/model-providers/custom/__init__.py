@@ -136,6 +136,14 @@ custom = CustomProfile(
         "llamacpp",
         "llama.cpp",
         "llama-cpp",
+        # Keyed ``providers:`` entries keep their bare config key as the
+        # provider id (resolve_user_provider returns id=name), so a named
+        # local-Ollama endpoint like ``ollama-cte700air`` is stored WITHOUT a
+        # ``custom:`` prefix. Registering it as an alias makes
+        # get_provider_profile("ollama-cte700air") resolve to this CustomProfile
+        # so ollama_num_ctx is injected into /api/chat. Mirrors how the bare
+        # ``ollama`` alias already resolves to this profile.
+        "ollama-cte700air",
     ),
     env_vars=(),  # No fixed key — custom endpoint
     base_url="",  # User-configured
