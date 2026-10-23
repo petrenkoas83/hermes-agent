@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import inspect
 import json
@@ -108,10 +109,26 @@ def _publish_pointer(pointer_file: Path, bind_path: Path) -> None:
         raise
 
 
+def pointer_path(home: Path, bind_path: Path) -> Path:
+    """Where the pointer naming ``bind_path`` lives.
+
+    Next to the socket when the socket left ``home`` (the sun_path or AF_UNIX-hostile-filesystem
+    fallback): that directory is private and on a filesystem that honours ``0600``, whereas
+    ``home`` may be vboxsf/9p, which silently keeps a ``0755`` mode and makes discovery refuse the
+    pointer as ``unsafe_control_pointer``. Otherwise ``home`` itself, as before.
+    """
+    if Path(bind_path).parent != Path(home):
+        return Path(bind_path).parent / _POINTER_FILENAME
+    return Path(home) / _POINTER_FILENAME
+
+
 def resolve_server_socket_path(home: Path) -> tuple[Path, Optional[Path]]:
     """Return ``(bind_path, pointer_file)``; pointer_file is set only for the temp-dir fallback."""
     direct = Path(home) / _SOCKET_FILENAME
-    return (direct, None) if _fits_sun_path(direct) else (_fallback_socket_path(home), Path(home) / _POINTER_FILENAME)
+    if _fits_sun_path(direct):
+        return direct, None
+    bind_path = _fallback_socket_path(home)
+    return bind_path, pointer_path(home, bind_path)
 
 
 def resolve_client_socket_path(home: Path) -> Optional[Path]:
@@ -119,12 +136,20 @@ def resolve_client_socket_path(home: Path) -> Optional[Path]:
     direct = Path(home) / _SOCKET_FILENAME
     if direct.exists():
         return direct
-    with contextlib.suppress(OSError):
-        pointer = Path(home) / _POINTER_FILENAME
-        target = pointer.read_text(encoding="utf-8-sig").strip() if pointer.is_file() else ""
-        if target and Path(target).exists():
-            return Path(target)
+    for pointer in _pointer_candidates(home):
+        with contextlib.suppress(OSError):
+            target = pointer.read_text(encoding="utf-8-sig").strip() if pointer.is_file() else ""
+            if target and Path(target).exists():
+                return Path(target)
     return None
+
+
+def _pointer_candidates(home: Path) -> list[Path]:
+    """Pointer locations a client may consult, most specific first: the relocated socket's own
+    directory (``$XDG_RUNTIME_DIR``/temp root, where the writer puts it) and then ``home`` for a
+    pointer published by an older gateway."""
+    candidates = [pointer_path(home, _fallback_socket_path(home)), Path(home) / _POINTER_FILENAME]
+    return list(dict.fromkeys(candidates))
 
 
 def _detect_supervisor() -> str:
@@ -248,7 +273,38 @@ class GatewayControlServer:
         # Restrictive umask so the socket is never world-connectable, even for the instant before chmod.
         old_umask = os.umask(0o177)
         try:
-            self._server = await asyncio.start_unix_server(self._handle_connection, path=str(bind_path))
+            try:
+                self._server = await asyncio.start_unix_server(self._handle_connection, path=str(bind_path))
+            except OSError as exc:
+                # Some filesystems (vboxsf, 9p, certain FUSE mounts) accept regular files but reject
+                # AF_UNIX binds with EPERM/EACCES/ENOTSUP. The sun_path-length fallback above cannot
+                # help there: the path is short, it is the *filesystem* that refuses. Relocate to the
+                # private runtime dir and publish the pointer so clients still find the listener.
+                if exc.errno not in (errno.EPERM, errno.EACCES, errno.ENOTSUP, errno.EOPNOTSUPP):
+                    raise
+                relocated = _fallback_socket_path(self._home)
+                if relocated == bind_path:
+                    raise
+                logger.warning(
+                    "Control socket bind on %s failed (%s); relocating to %s",
+                    bind_path, exc, relocated)
+                # NOTE: the restrictive umask above is still in force here, so mkdir(mode=0o700)
+                # would land as 0600 and _private_directory() would reject it. Create the dir
+                # with an explicit chmod instead of relying on the mode argument.
+                with contextlib.suppress(FileExistsError):
+                    relocated.parent.mkdir(parents=True, exist_ok=True)
+                with contextlib.suppress(OSError):
+                    os.chmod(relocated.parent, 0o700)
+                if not _private_directory(relocated.parent):
+                    relocated = _squat_proof_fallback(relocated)
+                    self._fallback_root = relocated.parent.parent
+                if relocated.exists():
+                    relocated.unlink()
+                bind_path = relocated
+                # Publish the pointer beside the relocated socket, not in ``home``: vboxsf/9p keep
+                # a 0755 mode on a file created 0600, and discovery refuses such a pointer.
+                pointer_file = pointer_path(self._home, bind_path)
+                self._server = await asyncio.start_unix_server(self._handle_connection, path=str(bind_path))
         finally:
             os.umask(old_umask)
         with contextlib.suppress(OSError):

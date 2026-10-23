@@ -857,11 +857,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             name="planned-stop-watcher")
         _planned_stop_watcher_thread.start()
 
-        # Right after the PID claim (which makes us authoritative). Fatal: local clients attach only
-        # with tickets minted on this listener, so startup aborts without it.
+        # Right after the PID claim (which makes us authoritative). Local clients attach with tickets
+        # minted on this listener, so losing it degrades local attach — but it must NOT abort startup:
+        # the documented contract (gateway/control_socket.py:GatewayControlServer) is that the gateway
+        # never refuses to serve messaging because its control socket couldn't bind. Filesystems that
+        # reject AF_UNIX binds (vboxsf, 9p) would otherwise crash-loop the whole gateway.
         _control_server = await _start_gateway_start_control_socket(runner)
         if _control_server is None:
-            raise RuntimeError("gateway session bootstrap control listener unavailable")
+            logger.warning(
+                "Gateway control socket unavailable; continuing without local attach tickets "
+                "(messaging, cron and the HTTP API are unaffected)")
         # Now the attach channel answers: republish the host record with the settled served set.
         _refresh_host_gateway_record(runner)
         _log_standalone_profiles_at_boot(runner)

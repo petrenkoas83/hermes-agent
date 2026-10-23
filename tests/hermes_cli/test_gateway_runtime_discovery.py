@@ -335,3 +335,87 @@ def test_upgraded_same_owner_0644_lock_is_narrowed_not_inaccessible(tmp_path):
     os.link(lock, tmp_path / 'alias')
     assert missing_owner_state(home) == 'inaccessible'
     assert stat.S_IMODE(lock.stat().st_mode) == 0o644
+
+
+def _runtime_dir(monkeypatch, tmp_path):
+    """A short private runtime dir, as the container provides at /tmp/hermes-runtime."""
+    import os
+    import tempfile
+    directory = Path(tempfile.mkdtemp(prefix='hrt-'))
+    os.chmod(directory, 0o700)
+    monkeypatch.setenv('XDG_RUNTIME_DIR', str(directory))
+    return directory
+
+
+@pytest.mark.platforms("linux")
+def test_discovery_reads_the_pointer_beside_the_relocated_socket(tmp_path, monkeypatch):
+    """The gateway publishes ``gateway.sock.path`` in the runtime dir (vboxsf keeps 0755 in home);
+    discovery must look there, not only in ``home``."""
+    import socket
+    from hermes_cli.gateway_runtime_discovery import _socket_path
+
+    home = tmp_path / 'profile'
+    home.mkdir(mode=0o700)
+    runtime = _runtime_dir(monkeypatch, tmp_path)
+    directory = runtime / f'hermes-gw-{_home_hash(home)}'
+    directory.mkdir(mode=0o700)
+    target = directory / 'control.sock'
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(target))
+        target.chmod(0o600)
+        pointer = directory / 'gateway.sock.path'
+        pointer.write_text(str(target), encoding='utf-8')
+        pointer.chmod(0o600)
+        assert _socket_path(home) == target
+
+
+@pytest.mark.platforms("linux")
+def test_a_stale_0755_pointer_in_home_does_not_mask_the_runtime_one(tmp_path, monkeypatch):
+    """A leftover 0755 pointer on vboxsf is unsafe, but the good pointer beside the socket wins."""
+    import socket
+    from hermes_cli.gateway_runtime_discovery import _socket_path
+
+    home = tmp_path / 'profile'
+    home.mkdir(mode=0o700)
+    runtime = _runtime_dir(monkeypatch, tmp_path)
+    directory = runtime / f'hermes-gw-{_home_hash(home)}'
+    directory.mkdir(mode=0o700)
+    target = directory / 'control.sock'
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(target))
+        target.chmod(0o600)
+        good = directory / 'gateway.sock.path'
+        good.write_text(str(target), encoding='utf-8')
+        good.chmod(0o600)
+        stale = home / 'gateway.sock.path'
+        stale.write_text(str(target), encoding='utf-8')
+        stale.chmod(0o755)
+        assert _socket_path(home) == target
+
+
+@pytest.mark.platforms("linux")
+def test_an_unsafe_pointer_alone_is_still_refused(tmp_path, monkeypatch):
+    """Relaxing the search must not relax the check: a lone 0755 pointer stays a refusal."""
+    from hermes_cli.gateway_runtime_discovery import _socket_path
+
+    home = tmp_path / 'profile'
+    home.mkdir(mode=0o700)
+    _runtime_dir(monkeypatch, tmp_path)
+    pointer = home / 'gateway.sock.path'
+    pointer.write_text('/tmp/whatever/control.sock', encoding='utf-8')
+    pointer.chmod(0o755)
+    with pytest.raises(DiscoveryError, match='unsafe_control_pointer'):
+        _socket_path(home)
+
+
+@pytest.mark.platforms("linux")
+def test_a_missing_pointer_is_missing_not_unsafe(tmp_path, monkeypatch):
+    """The runtime dir is recreated on every container start: before the gateway publishes,
+    discovery must report "nothing yet" (FileNotFoundError), not an unsafe boundary."""
+    from hermes_cli.gateway_runtime_discovery import _socket_path
+
+    home = tmp_path / 'profile'
+    home.mkdir(mode=0o700)
+    _runtime_dir(monkeypatch, tmp_path)
+    with pytest.raises(FileNotFoundError):
+        _socket_path(home)

@@ -42,6 +42,54 @@ if [ -d /run/service/.s6-svscan ]; then
     done
 fi
 
-# Skip the drop when already non-root.
-[ "$(id -u)" = 0 ] || exec /opt/hermes/.venv/bin/python -m hermes_cli.container_boot
-exec s6-setuidgid hermes /opt/hermes/.venv/bin/python -m hermes_cli.container_boot
+# BUG-015 (issue 2): /opt/hermes must be importable from any cwd.  The image
+# sets ENV PYTHONPATH=/opt/hermes (Containerfile), but cont-init.d scripts run
+# under `with-contenv` and a stale/overridden image could still lose it.  Set
+# it defensively here so `hermes_yaml` and `pm` resolve even when cwd is `/`.
+# This is belt-and-braces on top of the Containerfile fix, not a substitute.
+PYTHONPATH="/opt/hermes${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+
+# Safety net (Option C): a *path/import* failure must not crash-loop the
+# container.  A genuine reconcile error (bad profile, PermissionError, s6
+# registration failure) still exits non-zero so it is not masked.
+#
+# We distinguish the two by running the reconciler and inspecting its output:
+# only the specific "No module named 'hermes_yaml'|'pm'" signature is treated
+# as non-fatal.  Everything else propagates its real exit code.
+run_reconciler() {
+    if [ "$(id -u)" = 0 ]; then
+        s6-setuidgid hermes /opt/hermes/.venv/bin/python -m hermes_cli.container_boot
+    else
+        /opt/hermes/.venv/bin/python -m hermes_cli.container_boot
+    fi
+}
+
+log_file="${HERMES_HOME:-/opt/data}/logs/container-boot.log"
+mkdir -p "$(dirname "$log_file")" 2>/dev/null || true
+
+set +e
+output="$(run_reconciler 2>&1)"
+rc=$?
+set -e
+
+# Mirror the reconciler output to the container log (s6 captures stdout).
+printf '%s\n' "$output"
+printf '%s\n' "$output" >> "$log_file" 2>/dev/null || true
+
+if [ "$rc" -ne 0 ]; then
+    case "$output" in
+        *"No module named 'hermes_yaml'"*|*"No module named 'pm'"*)
+            echo "WARN: 02-reconcile-profiles: import path broken (hermes_yaml/pm not importable);" \
+                 "skipping profile reconciliation this boot. This is a non-fatal path bug —" \
+                 "fix PYTHONPATH=/opt/hermes in the image. rc=$rc" >&2
+            exit 0
+            ;;
+        *)
+            echo "ERR: 02-reconcile-profiles: reconciler failed with rc=$rc (genuine error, not masked)" >&2
+            exit "$rc"
+            ;;
+    esac
+fi
+
+exit 0

@@ -140,13 +140,20 @@ def connect_private(home: Path, timeout: float) -> socket.socket:
         raise
 
 
-def _socket_path(home: Path) -> Path:
-    _private_node(home, kind="directory", home=True)
-    direct = home / "gateway.sock"
-    if os.path.lexists(direct):
-        _private_node(direct, kind="socket")
-        return direct
-    pointer = home / "gateway.sock.path"
+def _pointer_candidates(home: Path) -> list[Path]:
+    """Where the gateway may have published ``gateway.sock.path``, most specific first.
+
+    A relocated socket (sun_path overflow, or an AF_UNIX-hostile filesystem such as vboxsf) keeps
+    its pointer beside itself — in the private runtime dir — because ``home`` may not honour
+    ``0600``. ``home`` stays a candidate for a pointer published by an older gateway.
+    """
+    from gateway.control_socket import _fallback_socket_path, pointer_path
+    candidates = [pointer_path(home, _fallback_socket_path(home)), home / "gateway.sock.path"]
+    return list(dict.fromkeys(candidates))
+
+
+def _read_pointer(pointer: Path, home: Path) -> Path:
+    """The socket path named by ``pointer``, after the owner/type/mode checks."""
     # Reject non-regular metadata before a FIFO can wait for a writer.
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK  # windows-footgun: ok — POSIX socket discovery only
     with os.fdopen(os.open(pointer, flags), "rb") as stream:  # windows-footgun: ok — binary POSIX descriptor
@@ -169,6 +176,33 @@ def _socket_path(home: Path) -> Path:
     _private_node(target.parent, kind="directory")
     _private_node(target, kind="socket")
     return target
+
+
+def _socket_path(home: Path) -> Path:
+    _private_node(home, kind="directory", home=True)
+    direct = home / "gateway.sock"
+    if os.path.lexists(direct):
+        _private_node(direct, kind="socket")
+        return direct
+    # A missing pointer is "no listener yet", not a refusal: the runtime dir is recreated on every
+    # container start, so a client may look before the gateway has published. An unsafe pointer is
+    # still a refusal — but only once every candidate has been tried, so a stale 0755 pointer left
+    # in a vboxsf home cannot mask the good one beside the socket.
+    unsafe: DiscoveryError | None = None
+    for pointer in _pointer_candidates(home):
+        if not os.path.lexists(pointer):
+            continue
+        try:
+            return _read_pointer(pointer, home)
+        except DiscoveryError as exc:
+            if exc.reason != "unsafe_control_pointer":
+                raise
+            unsafe = exc
+    if unsafe is not None:
+        raise unsafe
+    # No pointer anywhere: the same "nothing published yet" signal as before (callers treat
+    # FileNotFoundError as missing/starting, not as an unsafe boundary).
+    raise FileNotFoundError(errno.ENOENT, "no control socket or pointer", str(home))
 
 
 def query_identify(home: Path, *, timeout: float) -> dict:
