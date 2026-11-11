@@ -1982,7 +1982,18 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         # healthy transient (an update queued between arrival and the next getUpdates return, sub-second)
         # while fitting probe + re-probe inside one awake window.
         STUCK_CONFIRM_INTERVAL = 30
-        PROBE_TIMEOUT = 15        # seconds before declaring the path dead
+        # Must exceed the worst-case latency of ONE get_me() through TelegramFallbackTransport, or a
+        # healthy-but-slow path is read as "dead" and _schedule_polling_recovery tears down a healthy
+        # poller for no reason (measured 17-21 s deaf windows, 8 generations in a day).
+        #
+        # Since #136412 that transport bounds one request's WHOLE fallback walk with
+        # telegram_network._WALK_CONNECT_BUDGET_S (15.0 s of CONNECT time shared across the candidates), so
+        # the worst case is now:
+        #   15 s connect walk + 20 s read (HERMES_TELEGRAM_HTTP_READ_TIMEOUT default) + 8 s pool wait
+        # A 15 s probe budget fired asyncio.TimeoutError at the end of that walk, before the read phase had
+        # even started. 45 s covers the sum and stays well below HEARTBEAT_INTERVAL (90 s), so probes
+        # never overlap.
+        PROBE_TIMEOUT = 45        # seconds before declaring the path dead
         # Wedged-recovery watchdog: note when a recovery task is first seen in-flight and force-escalate
         # if the *same* task object still runs past the stuck timeout.
         # Tracked locally so no _polling_error_task assignment site needs to stamp a timestamp: the
