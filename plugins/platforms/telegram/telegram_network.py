@@ -13,6 +13,7 @@ import asyncio
 import ipaddress
 import logging
 import socket
+import time
 from typing import Iterable, Optional
 
 import httpx
@@ -98,8 +99,23 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
     # on its own (#63311).
     _POOL_LIMITS = httpx.Limits(max_connections=8, max_keepalive_connections=4)
 
+    # A candidate that just failed with a *retryable connect error* (the
+    # signature of a blackholed IP: the TCP connect burns the full caller
+    # timeout and then errors) is demoted behind the hostname path for this
+    # long. Demotion, never removal: an IPv4-only network still reaches the
+    # literals after the hostname fails, but one dead IP costs a single
+    # connect timeout per window instead of one per request — so no caller's
+    # deadline (notably the Telegram heartbeat probe) is eaten by the same
+    # dead candidate over and over. Deliberately a cache rather than a
+    # per-request deadline: this transport also carries getUpdates
+    # long-polls, which legitimately block ~50 s, so a short per-request
+    # deadline would kill healthy polls.
+    _FAILED_IP_COOLDOWN = 60.0
+
     def __init__(self, fallback_ips: Iterable[str], **transport_kwargs):
         self._fallback_ips = list(dict.fromkeys(_normalize_fallback_ips(fallback_ips)))
+        # ip -> monotonic deadline until which it trails the hostname attempt.
+        self._failed_until: dict[str, float] = {}
         proxy_url = _resolve_proxy_url(target_hosts=[_TELEGRAM_API_HOST, *self._fallback_ips])
         if proxy_url and "proxy" not in transport_kwargs:
             transport_kwargs["proxy"] = proxy_url
@@ -168,11 +184,24 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         if self._sticky_ip is not _UNSET:
             sticky = self._sticky_ip
             order.append(sticky if sticky is None else str(sticky))
+        now = time.monotonic()
+        cooling: list[Optional[str]] = []
         for ip in self._fallback_ips:
-            if ip not in order:
-                order.append(ip)
+            if ip in order:
+                continue
+            until = self._failed_until.get(ip)
+            if until is not None and until > now:
+                cooling.append(ip)
+                continue
+            self._failed_until.pop(ip, None)
+            order.append(ip)
         if None not in order:
             order.append(None)
+        # Recently-failed literals are demoted behind the hostname, not
+        # dropped — the walk still ends at them when everything else fails.
+        for ip in cooling:
+            if ip not in order:
+                order.append(ip)
         return order
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
@@ -187,6 +216,8 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             transport = self._primary if ip is None else await self._get_fallback(ip)
             try:
                 response = await transport.handle_async_request(candidate)
+                if ip is not None:
+                    self._failed_until.pop(ip, None)
                 if self._sticky_ip is _UNSET or self._sticky_ip != ip:
                     async with self._sticky_lock:
                         if self._sticky_ip is _UNSET or self._sticky_ip != ip:
@@ -219,6 +250,7 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                         exc,
                     )
                     continue
+                self._failed_until[ip] = time.monotonic() + self._FAILED_IP_COOLDOWN
                 logger.warning("[Telegram] IPv4 Telegram API IP %s failed: %s", ip, exc)
                 await self._reset_fallback(ip)
                 continue
