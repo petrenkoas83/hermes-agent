@@ -1565,8 +1565,11 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         if not self._polling_progress_event.is_set():
             # First confirmed round-trip resolves the "health pending" line both reconnect paths end on.
             # After network-error WARNINGs the line must read as the matching recovery event (#111211).
+            # WARNING, not INFO: the gateway's stderr->docker handler is pinned to WARNING at default
+            # verbosity, so an INFO anchor never reaches `docker logs`, and an external health watchdog
+            # that greps that stream could never clear a degradation verdict on a healthy recovery.
             state = "recovered" if self._polling_network_error_count else "confirmed healthy"
-            logger.info("[%s] Telegram polling %s: getUpdates progressing (generation %d)", self.name, state, generation)
+            logger.warning("[%s] Telegram polling %s: getUpdates progressing (generation %d)", self.name, state, generation)
         self._polling_progress_event.set()
         self._polling_last_progress_monotonic = time.monotonic()
         self._polling_network_error_count = 0
@@ -1945,7 +1948,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             if not app:
                 raise RuntimeError("Telegram application was torn down during reconnect")
             await self._start_polling_once(app, drop_pending_updates=False, error_callback=self._polling_error_callback_ref)
-            logger.info(
+            # WARNING: recovery anchor must survive the stderr handler's
+            # WARNING floor — see the note on "polling confirmed healthy".
+            logger.warning(
                 "[%s] Telegram polling restarted after network error (attempt %d); health pending getUpdates progress", self.name, attempt)
         except _PollingLifecycleAbort:
             return
@@ -2233,7 +2238,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             # self-perpetuating 409 loop of #75017 is stopped by _disarm_ptb_retry_loop.
             try:
                 await self._start_polling_once(app, drop_pending_updates=False, error_callback=self._polling_error_callback_ref)
-                logger.info(
+                # WARNING: recovery anchor must survive the stderr handler's
+                # WARNING floor — see the note on "polling confirmed healthy".
+                logger.warning(
                     "[%s] Telegram polling restarted after conflict retry %d/%d; health pending getUpdates progress",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES)
                 return
