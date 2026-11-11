@@ -2688,7 +2688,11 @@ class TelegramAdapter(BasePlatformAdapter):
             # "reconnected and healthy" is byte-identical to "reconnected
             # and hung" — a wedged long-poll is invisible until a user
             # notices silence (#90504).
-            logger.info(
+            # WARNING, not INFO: the gateway's stderr->docker handler is pinned
+            # to WARNING at default verbosity, so an INFO anchor never reaches
+            # `docker logs`. External watchdogs (and every operator reading the
+            # container log) need this line to clear a degradation verdict.
+            logger.warning(
                 "[%s] Telegram polling confirmed healthy: getUpdates progressing "
                 "(generation %d)",
                 self.name,
@@ -3221,7 +3225,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 drop_pending_updates=False,
                 error_callback=self._polling_error_callback_ref,
             )
-            logger.info(
+            # WARNING: recovery anchor must survive the stderr handler's
+            # WARNING floor — see the note on "polling confirmed healthy".
+            logger.warning(
                 "[%s] Telegram polling restarted after network error (attempt %d); "
                 "health pending getUpdates progress",
                 self.name, attempt,
@@ -3797,7 +3803,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     drop_pending_updates=True,
                     error_callback=self._polling_error_callback_ref,
                 )
-                logger.info(
+                # WARNING: recovery anchor must survive the stderr handler's
+                # WARNING floor — see the note on "polling confirmed healthy".
+                logger.warning(
                     "[%s] Telegram polling restarted after conflict retry %d/%d; "
                     "health pending getUpdates progress",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
