@@ -3280,7 +3280,25 @@ class TelegramAdapter(BasePlatformAdapter):
         steady-state operation without any prior error event.
         """
         HEARTBEAT_INTERVAL = 90   # seconds between probes
-        PROBE_TIMEOUT = 15        # seconds before declaring the path dead
+        # Must exceed the worst-case latency of ONE get_me() through
+        # TelegramFallbackTransport, or a healthy-but-slow path is read as
+        # "dead" and the poller is restarted for no reason.
+        #
+        # Worst case walk (see telegram_network.handle_async_request): sticky
+        # IP (if set) fails, then each remaining fallback candidate, then the
+        # dual-stack hostname. Every candidate gets its own
+        # HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT (default 10.0 s), and the walk
+        # has NO per-target budget, so one blackholed IP costs a full connect
+        # timeout before the next candidate is tried. With the two seed
+        # literals (149.154.166.110, 149.154.167.220) that is 2 x 10 s = 20 s
+        # of pure connect time before the hostname path is even attempted;
+        # the old 15 s budget fired asyncio.TimeoutError mid-walk and
+        # _schedule_polling_recovery tore down a healthy poller (measured
+        # 17-21 s deaf windows, 8 generations in a day).
+        #
+        # 45 s covers the 20 s two-candidate walk plus read/pool overhead and
+        # stays well below HEARTBEAT_INTERVAL (90 s) so probes never overlap.
+        PROBE_TIMEOUT = 45        # seconds before declaring the path dead
 
         # Wedged-recovery watchdog state (#66377). Tracked locally so no
         # _polling_error_task assignment site needs to stamp a timestamp: the
