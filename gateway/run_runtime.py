@@ -47,7 +47,14 @@ async def _build_profile_authority(runner, name, home, *, register):
     with _profile_runtime_scope(home, hydrate_secrets=False):
         if db is None:
             raise RuntimeError(_store_open_failure(runner, home))
-        if (await asyncio.to_thread(Path(db.db_path).resolve)).parent != home:
+        resolved_db = await asyncio.to_thread(Path(db.db_path).resolve)
+        # LOCAL PATCH (fork): the vboxsf layout keeps state.db on guest-local ext4,
+        # bind-mounted at HERMES_HOME/db and reached through a symlink
+        # HERMES_HOME/state.db -> db/state.db, so the resolved store sits in
+        # HERMES_HOME/db rather than HERMES_HOME itself. Both are inside the reserved
+        # profile's own subtree and nothing outside it is accepted. Keep this fork-only
+        # relaxation when merging the next upstream base; see docs/21-state-db-local-disk.md.
+        if resolved_db.parent not in (home, Path(home) / 'db'):
             raise RuntimeError(f'session authority database does not belong to the reserved profile {home}')
         registry.add(home, None, name=name)
         try:
