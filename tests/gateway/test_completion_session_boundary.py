@@ -32,7 +32,7 @@ def isolated_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import tools.process_registry as pr_module
 
-    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr(pr_module, "_checkpoint_path", lambda: tmp_path / "processes.json")
     registry = pr_module.ProcessRegistry()
     monkeypatch.setattr(pr_module, "process_registry", registry)
     return registry
@@ -51,6 +51,9 @@ class _SessionDB:
 
 
 def _runner(adapter, *, session_db=...):
+    def admit(event):
+        event._gateway_accepted = True
+    adapter.handle_message.side_effect = admit
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
@@ -322,7 +325,7 @@ def test_parent_session_id_survives_checkpoint_recovery(tmp_path, monkeypatch):
         "notify_on_complete": True,
         "parent_session_id": "sess-spawner",
     }]), encoding="utf-8")
-    monkeypatch.setattr(pr_module, "CHECKPOINT_PATH", checkpoint)
+    monkeypatch.setattr(pr_module, "_checkpoint_path", lambda: checkpoint)
 
     registry = ProcessRegistry()
     monkeypatch.setattr(registry, "_host_pid_is_ours", lambda *_a: True)

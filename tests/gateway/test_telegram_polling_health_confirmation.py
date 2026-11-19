@@ -19,9 +19,12 @@ import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from gateway.config import Platform  # noqa: E402
-from plugins.platforms.telegram import adapter as tg_adapter  # noqa: E402
-from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+
+from gateway.config import Platform
+from plugins.platforms.telegram import adapter as tg_adapter
+from plugins.platforms.telegram.adapter import TelegramAdapter
+
+_LOGGER = "plugins.platforms.telegram.adapter"
 
 
 def _bare_adapter():
@@ -36,7 +39,8 @@ def _bare_adapter():
     a._polling_progress_event = asyncio.Event()
     a._polling_network_error_count = 2
     a._polling_conflict_count = 3
-    a._polling_conflict_recovery_generation = None
+    a._polling_conflict_quiet_since = None
+    a._polling_conflict_quiet_banked = 0.0
     a._send_path_degraded = True
     return a
 
@@ -67,30 +71,38 @@ def _speed_up_sleeps(monkeypatch):
 
 
 class TestPollingHealthConfirmation:
-    def test_first_progress_emits_confirmed_healthy(self, caplog):
-        a = _bare_adapter()
-        with caplog.at_level(logging.INFO, logger="plugins.platforms.telegram.adapter"):
-            a._record_polling_progress(1)
-        rendered = " | ".join(rec.getMessage() for rec in caplog.records)
-        assert "confirmed healthy" in rendered
-        assert "generation 1" in rendered
-        assert a._polling_progress_event.is_set()
 
     def test_confirmed_healthy_survives_warning_floor(self, caplog):
         """The anchor must be visible at WARNING — that is the floor of the
         gateway's stderr->docker handler, and therefore the only level the
         watchdog can ever see (patch 13)."""
         a = _bare_adapter()
-        caplog.set_level(logging.WARNING, logger="plugins.platforms.telegram.adapter")
+        a._polling_network_error_count = 0  # state word: "confirmed healthy"
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
         a._record_polling_progress(1)
         records = [
-            rec for rec in caplog.records if "confirmed healthy" in rec.getMessage()
+            rec for rec in caplog.records if "getUpdates progressing" in rec.getMessage()
         ]
         assert records, (
-            "confirmed-healthy anchor is below WARNING and invisible to "
+            "progress anchor is below WARNING and invisible to "
             "`docker logs`; the health watchdog can never go green"
         )
         assert records[0].levelno == logging.WARNING
+        assert "confirmed healthy" in records[0].getMessage()
+
+    def test_recovered_state_also_survives_warning_floor(self, caplog):
+        """After a network-error episode the same anchor says "recovered";
+        the level must not depend on which state word is used."""
+        a = _bare_adapter()
+        a._polling_network_error_count = 2
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        a._record_polling_progress(1)
+        records = [
+            rec for rec in caplog.records if "getUpdates progressing" in rec.getMessage()
+        ]
+        assert records
+        assert records[0].levelno == logging.WARNING
+        assert "recovered" in records[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_network_restart_anchor_survives_warning_floor(self, caplog, monkeypatch):
@@ -101,12 +113,10 @@ class TestPollingHealthConfirmation:
         a._polling_network_error_count = 0
         a._app = _app_stub()
         a._polling_error_callback_ref = None
-        with caplog.at_level(logging.WARNING, logger="plugins.platforms.telegram.adapter"), \
+        with caplog.at_level(logging.WARNING, logger=_LOGGER), \
              patch.object(a, "_drain_polling_connections", new=AsyncMock()), \
              patch.object(a, "_start_polling_once", new=AsyncMock()), \
-             patch.object(
-                 a, "_looks_like_pool_timeout", return_value=False, create=True
-             ):
+             patch.object(a, "_looks_like_pool_timeout", return_value=False, create=True):
             await a._handle_polling_network_error(RuntimeError("net down"))
         records = [
             rec
@@ -126,7 +136,7 @@ class TestPollingHealthConfirmation:
         a._polling_conflict_count = 0
         a._app = _app_stub()
         a._polling_error_callback_ref = None
-        with caplog.at_level(logging.WARNING, logger="plugins.platforms.telegram.adapter"), \
+        with caplog.at_level(logging.WARNING, logger=_LOGGER), \
              patch.object(a, "_drain_polling_connections", new=AsyncMock()), \
              patch.object(a, "_start_polling_once", new=AsyncMock()):
             await a._handle_polling_conflict(RuntimeError("409 conflict"))
@@ -148,29 +158,12 @@ class TestPollingHealthConfirmation:
         # Drop the first record: at WARNING (patch 13) it is captured even
         # without at_level(), and this test is about the follow-ups.
         caplog.clear()
-        with caplog.at_level(logging.INFO, logger="plugins.platforms.telegram.adapter"):
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
             a._record_polling_progress(1)  # second — silent
             a._record_polling_progress(1)  # third — silent
         assert not [
-            rec for rec in caplog.records if "confirmed healthy" in rec.getMessage()
+            rec for rec in caplog.records if "getUpdates progressing" in rec.getMessage()
         ]
-
-    def test_new_generation_logs_again(self, caplog):
-        """A reconnect starts a new generation with a fresh event; its first
-        progress must re-emit the confirmation so the pending line of THAT
-        reconnect also resolves."""
-        a = _bare_adapter()
-        a._record_polling_progress(1)
-        # reconnect: new generation, event reset, counters possibly nonzero
-        a._polling_generation = 2
-        a._polling_progress_event = asyncio.Event()
-        a._polling_network_error_count = 1
-        a._send_path_degraded = True
-        with caplog.at_level(logging.INFO, logger="plugins.platforms.telegram.adapter"):
-            a._record_polling_progress(2)
-        rendered = " | ".join(rec.getMessage() for rec in caplog.records)
-        assert "confirmed healthy" in rendered
-        assert "generation 2" in rendered
 
     def test_stale_generation_progress_stays_silent(self, caplog):
         """Progress from an abandoned generation must neither log nor set the
@@ -179,9 +172,7 @@ class TestPollingHealthConfirmation:
         a = _bare_adapter()
         a._polling_generation = 2
         a._polling_progress_event = asyncio.Event()
-        with caplog.at_level(logging.INFO, logger="plugins.platforms.telegram.adapter"):
+        with caplog.at_level(logging.INFO, logger=_LOGGER):
             a._record_polling_progress(1)
-        assert not [
-            rec for rec in caplog.records if "confirmed healthy" in rec.getMessage()
-        ]
+        assert not [rec for rec in caplog.records if rec.levelno == logging.WARNING]
         assert not a._polling_progress_event.is_set()

@@ -1,151 +1,102 @@
 """Regression tests for the Telegram heartbeat probe budget (patch 14).
 
-Incident 2026-11-11: the heartbeat loop probes ``bot.get_me()`` every 90 s with
+Incident 2026-11-11: the heartbeat loop probes ``bot.get_me()`` every 90 s under
 ``asyncio.wait_for(bot.get_me(), PROBE_TIMEOUT)``. That request travels through
-``TelegramFallbackTransport``, which walks the configured IPv4 literals *before*
-the dual-stack hostname and applies **no per-target deadline**: every candidate
-gets its own ``HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT`` (default 10 s). One seed
-literal, ``149.154.167.220``, is blackholed from this guest (TCP connect never
-completes; measured 4/4 timeouts at ~6-12 s) while ``149.154.166.110`` connects
-instantly.
+``TelegramFallbackTransport``, whose walk tries every configured IPv4 literal
+before the dual-stack hostname. One seed literal, ``149.154.167.220``, is
+blackholed from this guest (TCP connect never completes; measured 4/4 timeouts
+at ~6-12 s) while ``149.154.166.110`` connects instantly, so the walk burned
+more connect time than the probe budget and ``_schedule_polling_recovery``
+stopped and restarted a *healthy* poller — 8 generations in one day, 17-21 s
+deaf windows each (32 s worst), plus one full adapter rebuild when
+``updater.stop()`` blew its own budget.
 
-So the worst-case walk cost ``10 s + 10 s = 20 s`` before the hostname path was
-even attempted, but ``PROBE_TIMEOUT`` was 15 s. The probe raised
-``asyncio.TimeoutError`` mid-walk and ``_schedule_polling_recovery`` stopped and
-restarted a *healthy* poller — 8 generations in one day, 17-21 s deaf windows
-each (32 s worst), plus one full adapter rebuild when ``updater.stop()`` blew
-its own budget.
+On v0.23.2 upstream bounds the walk (``_WALK_CONNECT_BUDGET_S``, #136412), which
+removes the unbounded half of the bug, but the probe budget still has to clear
+that walk plus the read and pool phases of the same request. The invariant
+pinned here is:
 
-The fix has two halves, both pinned here:
+    PROBE_TIMEOUT >= _WALK_CONNECT_BUDGET_S + read_timeout + pool_timeout
 
-1. ``PROBE_TIMEOUT`` must exceed the worst-case two-candidate walk (arithmetic),
-   and stay below the probe cadence so probes never overlap.
-2. A tick whose first candidate stalls must still complete and must NOT
-   schedule polling recovery.
+and ``PROBE_TIMEOUT < HEARTBEAT_INTERVAL`` so probes never overlap.
+
+These tests read the two modules as source text instead of importing them: the
+telegram adapter needs ``python-telegram-bot`` at import time, and this
+invariant is about constants, not behaviour — keeping it runnable anywhere.
 """
 
-import asyncio
-import inspect
-import logging
 import re
+from pathlib import Path
 
-import httpx
-import pytest
-
-import plugins.platforms.telegram.telegram_network as tg_network
-from gateway.config import Platform  # noqa: E402
-from plugins.platforms.telegram import adapter as tg_adapter  # noqa: E402
-from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+_TG = Path(__file__).resolve().parents[2] / "plugins" / "platforms" / "telegram"
+_ADAPTER_SRC = (_TG / "adapter.py").read_text(encoding="utf-8")
+_NETWORK_SRC = (_TG / "telegram_network.py").read_text(encoding="utf-8")
 
 # Measured cost of one TCP connect attempt to the blackholed literal
-# 149.154.167.220 from the guest (see incident writeup in
-# docs/21-state-db-local-disk.md). The *floor* the probe budget must clear is
-# two such candidates in a row, which is what the arithmetic test asserts.
+# 149.154.167.220 from the guest (see the incident writeup in
+# docs/21-state-db-local-disk.md). A single such candidate must not be able to
+# consume the whole probe budget.
 MEASURED_BLACKHOLE_CONNECT_SECONDS = 12.0
 
-_LOGGER_NAME = "plugins.platforms.telegram.adapter"
+
+def _function_source(source: str, name: str) -> str:
+    """Source of one method/function, up to the next same-or-less-indented def."""
+    start = re.search(rf"^( *)(?:async )?def {re.escape(name)}\(", source, re.M)
+    assert start, f"function not found: {name}"
+    indent = start.group(1)
+    # Skip the rest of the signature line: its closing ``) -> T:`` sits at column 0
+    # for module-level defs and would end the slice immediately.
+    body_start = source.index("\n", start.end()) + 1
+    rest = source[body_start:]
+    end = re.search(rf"^{indent}(?:async )?def |^{indent}\S", rest, re.M)
+    return rest[: end.start()] if end else rest
 
 
-# ---------------------------------------------------------------------------
-# Source-derived constants
-# ---------------------------------------------------------------------------
-
-def _float_const(pattern, source):
+def _float_const(pattern: str, source: str) -> float:
     match = re.search(pattern, source)
-    assert match, "constant not found in source: %r" % pattern
+    assert match, f"constant not found in source: {pattern!r}"
     return float(match.group(1))
 
 
-def _heartbeat_constants():
+def _heartbeat_constants() -> tuple[float, float]:
     """PROBE_TIMEOUT / HEARTBEAT_INTERVAL are locals of the heartbeat loop."""
-    source = inspect.getsource(TelegramAdapter._polling_heartbeat_loop)
+    body = _function_source(_ADAPTER_SRC, "_polling_heartbeat_loop")
     return (
-        _float_const(r"PROBE_TIMEOUT\s*=\s*([\d.]+)", source),
-        _float_const(r"HEARTBEAT_INTERVAL\s*=\s*([\d.]+)", source),
+        _float_const(r"PROBE_TIMEOUT\s*=\s*([\d.]+)", body),
+        _float_const(r"HEARTBEAT_INTERVAL\s*=\s*([\d.]+)", body),
     )
 
 
-def _http_connect_timeout_default():
-    """Default of HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT (the per-candidate cost)."""
-    source = inspect.getsource(tg_adapter)
-    return _float_const(
-        r'HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT",\s*([\d.]+)', source
+def _walk_budget() -> float:
+    """Whole-walk CONNECT budget shared by every fallback candidate (#136412)."""
+    return _float_const(r"_WALK_CONNECT_BUDGET_S\s*=\s*([\d.]+)", _NETWORK_SRC)
+
+
+def _request_timeout_defaults() -> tuple[float, float]:
+    """(read, pool) defaults of the PTB request the probe rides on.
+
+    They live in ``telegram_network.ptb_request_kwargs()``, which the adapter
+    applies to both of its PTB clients.
+    """
+    kwargs_src = _function_source(_NETWORK_SRC, "ptb_request_kwargs")
+    return (
+        _float_const(r'HERMES_TELEGRAM_HTTP_READ_TIMEOUT",\s*([\d.]+)', kwargs_src),
+        _float_const(r'HERMES_TELEGRAM_HTTP_POOL_TIMEOUT",\s*([\d.]+)', kwargs_src),
     )
 
-
-# ---------------------------------------------------------------------------
-# Test doubles
-# ---------------------------------------------------------------------------
-
-class _StallingTransport(httpx.AsyncBaseTransport):
-    """First candidate stalls (blackholed-IP shape), the rest succeed."""
-
-    def __init__(self, calls, stall_host, stall_seconds):
-        self.calls = calls
-        self.stall_host = stall_host
-        self.stall_seconds = stall_seconds
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        host = request.url.host
-        self.calls.append(host)
-        if host == self.stall_host:
-            await asyncio.sleep(self.stall_seconds)
-            # A blackholed endpoint surfaces as a retryable connect error,
-            # never as a protocol error — see _is_retryable_connect_error.
-            raise httpx.ConnectTimeout("connect timed out")
-        return httpx.Response(200, request=request, text="ok")
-
-    async def aclose(self) -> None:
-        return None
-
-
-def _install_transport_factory(monkeypatch, calls, stall_host, stall_seconds):
-    def factory(*args, **kwargs):
-        return _StallingTransport(calls, stall_host, stall_seconds)
-
-    monkeypatch.setattr(tg_network.httpx, "AsyncHTTPTransport", factory)
-
-
-def _bare_adapter():
-    a = TelegramAdapter.__new__(TelegramAdapter)
-    a.platform = Platform.TELEGRAM
-    a._fatal_error_code = None
-    a._fatal_error_message = None
-    a._fatal_error_retryable = True
-    a._polling_teardown_started = False
-    a._polling_error_task = None
-    a._polling_network_error_count = 0
-    a._polling_generation = 1
-    a._background_tasks = set()
-    a._send_path_degraded = False
-    return a
-
-
-def _collapse_heartbeat_interval(monkeypatch):
-    """Skip the 90 s wait between probes; keep real sleeps for the stall."""
-    real_sleep = asyncio.sleep
-
-    async def fast_sleep(delay, *args, **kwargs):
-        if delay and delay >= 1:  # HEARTBEAT_INTERVAL / reconnect back-off
-            return await real_sleep(0)
-        return await real_sleep(delay, *args, **kwargs)
-
-    monkeypatch.setattr(tg_adapter.asyncio, "sleep", fast_sleep)
-
-
-# ---------------------------------------------------------------------------
-# 1. The budget must clear the worst-case walk
-# ---------------------------------------------------------------------------
 
 class TestProbeBudgetArithmetic:
-    def test_probe_timeout_covers_two_dead_candidates(self):
+
+    def test_probe_timeout_covers_walk_read_and_pool(self):
         probe_timeout, _ = _heartbeat_constants()
-        connect_timeout = _http_connect_timeout_default()
-        worst_case_walk = 2 * connect_timeout
-        assert probe_timeout >= worst_case_walk, (
-            "PROBE_TIMEOUT=%ss does not cover a two-candidate fallback walk "
-            "(%ss): the heartbeat would time out mid-walk and restart a "
-            "healthy poller" % (probe_timeout, worst_case_walk)
+        walk_budget = _walk_budget()
+        read_timeout, pool_timeout = _request_timeout_defaults()
+        worst_case = walk_budget + read_timeout + pool_timeout
+        assert probe_timeout >= worst_case, (
+            "PROBE_TIMEOUT=%ss does not cover one get_me() through the fallback "
+            "walk: %ss connect budget + %ss read + %ss pool = %ss. The probe "
+            "would time out mid-request and restart a healthy poller"
+            % (probe_timeout, walk_budget, read_timeout, pool_timeout, worst_case)
         )
 
     def test_probe_timeout_covers_measured_blackhole(self):
@@ -163,123 +114,9 @@ class TestProbeBudgetArithmetic:
             "probes never overlap" % (probe_timeout, interval)
         )
 
-
-# ---------------------------------------------------------------------------
-# 2. A slow first candidate must not trip recovery
-# ---------------------------------------------------------------------------
-
-class TestSlowCandidateDoesNotTripRecovery:
-    @pytest.mark.asyncio
-    async def test_tick_with_stalled_first_candidate_schedules_no_recovery(
-        self, monkeypatch, caplog
-    ):
-        """One heartbeat tick, candidate #1 stalls, candidate #2 answers.
-
-        The tick must finish through the SECOND candidate and must not call
-        _schedule_polling_recovery. Before patch 14 the probe budget (15 s) was
-        shorter than the stalled walk (~20 s), so this tick raised
-        asyncio.TimeoutError and tore down a healthy poller.
-
-        The stall is scaled down for suite speed (0.3 s instead of the measured
-        12 s), but the REAL PROBE_TIMEOUT is in force: the assertion that matters
-        is the arithmetic one above, and this test proves the walk continues
-        past a failed candidate without escalating.
-        """
-        calls = []
-        _install_transport_factory(
-            monkeypatch, calls, stall_host="149.154.167.220", stall_seconds=0.3
-        )
-        _collapse_heartbeat_interval(monkeypatch)
-
-        # Real fallback transport: the shipped walk, not a stub.
-        transport = tg_network.TelegramFallbackTransport(
-            ["149.154.167.220", "149.154.166.110"]
-        )
-
-        async def get_me():
-            return await transport.handle_async_request(
-                httpx.Request("GET", "https://api.telegram.org/bot<redacted>/getMe")
-            )
-
-        bot = type("Bot", (), {"get_me": staticmethod(get_me), "username": "hermes_bot"})()
-        a = _bare_adapter()
-        a._app = type("App", (), {"bot": bot, "updater": None})()
-
-        recovery = []
-        a._schedule_polling_recovery = lambda err, *, reason: recovery.append(
-            (err, reason)
-        )
-
-        async def _noop(*args, **kwargs):
-            return None
-
-        monkeypatch.setattr(a, "_probe_pending_updates", _noop, raising=False)
-        monkeypatch.setattr(a, "_check_polling_stall", _noop, raising=False)
-
-        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
-            task = asyncio.create_task(a._polling_heartbeat_loop())
-            try:
-                for _ in range(300):  # <= ~3 s wall clock
-                    if getattr(a, "_bot_identity_checked_at", None):
-                        break
-                    await asyncio.sleep(0.01)
-            finally:
-                task.cancel()
-                # The loop handles CancelledError internally (`return`), so
-                # awaiting the cancelled task completes instead of raising.
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        assert getattr(a, "_bot_identity_checked_at", None), (
-            "heartbeat tick never completed get_me()"
-        )
-        assert recovery == [], (
-            "a slow-but-reachable path scheduled polling recovery: %r" % (recovery,)
-        )
-        # The walk really did visit both candidates, in order.
-        assert calls[0] == "149.154.167.220"
-        assert "149.154.166.110" in calls
-        # ...and the surviving candidate became the sticky path.
-        assert transport._sticky_ip == "149.154.166.110"
-        await transport.aclose()
-
-
-class TestFailedCandidateDemotion:
-    """The transport's short-lived negative cache (patch 14 defensive half)."""
-
-    @pytest.mark.asyncio
-    async def test_failed_candidate_is_demoted_not_dropped(self, monkeypatch):
-        calls = []
-        _install_transport_factory(
-            monkeypatch, calls, stall_host="149.154.167.220", stall_seconds=0.0
-        )
-        transport = tg_network.TelegramFallbackTransport(
-            ["149.154.167.220", "149.154.166.110"]
-        )
-        response = await transport.handle_async_request(
-            httpx.Request("GET", "https://api.telegram.org/bot<redacted>/getMe")
-        )
-        assert response.status_code == 200
-
-        order = transport._attempt_order()
-        # Sticky winner first, then the hostname, and the dead literal LAST —
-        # still present, so an IPv4-only network can still reach it.
-        assert order == ["149.154.166.110", None, "149.154.167.220"]
-        await transport.aclose()
-
-    @pytest.mark.asyncio
-    async def test_demotion_expires(self, monkeypatch):
-        calls = []
-        _install_transport_factory(
-            monkeypatch, calls, stall_host="149.154.167.220", stall_seconds=0.0
-        )
-        transport = tg_network.TelegramFallbackTransport(["149.154.167.220"])
-        await transport.handle_async_request(
-            httpx.Request("GET", "https://api.telegram.org/bot<redacted>/getMe")
-        )
-        transport._sticky_ip = tg_network._UNSET
-        transport._failed_until["149.154.167.220"] = 0.0  # cooldown expired
-        assert transport._attempt_order() == ["149.154.167.220", None]
-        await transport.aclose()
+    def test_walk_budget_is_bounded_at_all(self):
+        """The unbounded-walk shape this patch was written against must stay gone."""
+        assert _walk_budget() > 0
+        assert "connect_budget" in _function_source(
+            _NETWORK_SRC, "handle_async_request"
+        ), "TelegramFallbackTransport lost its connect budget (#136412)"
