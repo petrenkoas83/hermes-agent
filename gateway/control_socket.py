@@ -41,7 +41,13 @@ _DEFAULT_CLIENT_TIMEOUT = 2.0
 # What a filesystem that cannot host an AF_UNIX node answers: a Docker Desktop (virtiofs) bind mount
 # refuses the socket, and an inode a previous container left there can be neither stat'ed nor
 # removed from inside (#123761). Not EADDRINUSE: a live sibling must keep failing loudly.
-_SOCKET_UNSUPPORTED_ERRNOS = frozenset({errno.EOPNOTSUPP, errno.ENOTSUP})
+# LOCAL PATCH (fork, v0.23.2-p9-14): add EPERM/EACCES. VirtualBox's shared folders (vboxsf) answer
+# EPERM to bind(2) on an AF_UNIX node, so our documented HERMES_HOME=/opt/data layout hit
+# "Gateway control socket failed to start: [Errno 1] Operation not permitted" and the mandatory
+# listener aborted bootstrap. See docs/21-state-db-local-disk.md and the same fix already applied
+# to the loop-tick witness (gateway/shutdown_watchdog.py: _LOOP_TICK_UNSUPPORTED_ERRNOS).
+_SOCKET_UNSUPPORTED_ERRNOS = frozenset(
+    {errno.EPERM, errno.EACCES, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
 def _home_hash(home: Path) -> str:
@@ -115,8 +121,49 @@ def _publish_pointer(pointer_file: Path, bind_path: Path) -> None:
         raise
 
 
+def control_socket_candidates(home: Path) -> list[tuple[Path, Optional[Path]]]:
+    """Ordered ``(bind_path, pointer_file)`` candidates for the server listener, best first.
+
+    LOCAL PATCH (fork, v0.23.2-p9-14): the shared folder must never be the first choice. Every
+    candidate reuses the upstream private-directory formula — ``hermes-gw-<hash>/control.sock``
+    with the same ``<hash>`` of ``HERMES_HOME`` the loop-tick witness and the temp-dir fallback
+    already use — so consumers keep authenticating through the same 0600 pointer:
+
+      1. ``$XDG_RUNTIME_DIR/hermes-gw-<hash>/control.sock`` (private runtime dir), if any;
+      2. ``<tempfile.gettempdir()>/hermes-gw-<hash>/control.sock``;
+      3. ``/tmp/hermes-gw-<hash>/control.sock`` (the short root AF_UNIX needs);
+      4. the legacy ``<HERMES_HOME>/gateway.sock``, last, for hosts with no usable runtime dir.
+
+    Candidates 1-3 publish ``<HERMES_HOME>/gateway.sock.path``; the in-home listener is its own
+    pointer, so it publishes nothing. Only candidates that fit ``sun_path`` are returned, and an
+    empty list (unreachable in practice: the in-home leaf fits for every realistic home) means the
+    caller must fail. The server walks this list and moves on when a filesystem answers "I cannot
+    host a socket" — see ``_SOCKET_UNSUPPORTED_ERRNOS``. Rationale and incident:
+    docs/21-state-db-local-disk.md.
+    """
+    base = Path(home)
+    name = f"hermes-gw-{_home_hash(base)}/control.sock"
+    pointer = base / _POINTER_FILENAME
+    ordered: list[tuple[Path, Optional[Path]]] = []
+    runtime = _private_runtime_dir()
+    if runtime is not None:
+        ordered.append((runtime / name, pointer))
+    ordered.append((Path(tempfile.gettempdir()) / name, pointer))
+    if not _IS_WINDOWS:  # no-tmp: ok — AF_UNIX needs the shortest root, /tmp is the documented one
+        ordered.append((Path("/tmp") / name, pointer))
+    ordered.append((base / _SOCKET_FILENAME, None))
+    candidates: list[tuple[Path, Optional[Path]]] = []
+    for bind_path, pointer_file in ordered:  # tempfile.gettempdir() is usually /tmp itself
+        if any(bind_path == seen for seen, _ in candidates) or not _fits_sun_path(bind_path):
+            continue
+        candidates.append((bind_path, pointer_file))
+    return candidates
+
+
 def resolve_server_socket_path(home: Path) -> tuple[Path, Optional[Path]]:
-    """Return ``(bind_path, pointer_file)``; pointer_file is set only for the temp-dir fallback."""
+    """Return the *in-home* ``(bind_path, pointer_file)``. pointer_file is set only when the home
+    path exceeds ``sun_path``. Kept for consumers that ask "where would a legacy in-home listener
+    be?"; the server itself walks :func:`control_socket_candidates` (fork patch)."""
     direct = Path(home) / _SOCKET_FILENAME
     return (direct, None) if _fits_sun_path(direct) else (_fallback_socket_path(home), Path(home) / _POINTER_FILENAME)
 
@@ -240,29 +287,82 @@ class GatewayControlServer:
     async def _start_posix(self) -> bool:
         if self._request_dispatch is None:
             self._request_dispatch = ControlRequestDispatcher()
-        bind_path, pointer_file = resolve_server_socket_path(self._home)
-        try:
-            bind_path = await self._bind_posix(bind_path, pointer_file)
-        except OSError as exc:
-            # A home that fits sun_path can still refuse the socket (Docker Desktop bind mounts,
-            # #123761): listen on the same private temp-dir socket + pointer an over-long home uses.
-            if pointer_file is not None or exc.errno not in _SOCKET_UNSUPPORTED_ERRNOS:
-                raise
-            logger.warning("Control socket cannot be created in %s (%s); listening in a private temp directory",
-                           self._home, exc.strerror or exc)
-            pointer_file = Path(self._home) / _POINTER_FILENAME
-            bind_path = await self._bind_posix(_fallback_socket_path(self._home), pointer_file)
+        bind_path, pointer_file = await self._bind_first_available()
         self._bind_path = bind_path
         info = bind_path.lstat()
         self._file_identities[bind_path] = (info.st_dev, info.st_ino)
         if pointer_file is not None:
-            _publish_pointer(pointer_file, bind_path)
-            self._pointer_file = pointer_file
+            # LOCAL PATCH (fork, v0.23.2-p9-14): the in-home leaf is no longer the listener, and
+            # resolve_client_socket_path prefers an existing direct path over the pointer — so a
+            # node a pre-patch gateway left behind (a rolled-back cutover leaves exactly that)
+            # would shadow the live socket. We won the PID-file claim, so any in-home node is stale;
+            # same rationale as the unlink in _bind_posix.
+            self._unlink_stale_in_home_leaf(bind_path)
+            self._publish_pointer_best_effort(pointer_file, bind_path)
         for path in filter(None, (self._bind_path, self._pointer_file)):
             info = path.lstat()
             self._file_identities[path] = (info.st_dev, info.st_ino)
         logger.info("Gateway control socket listening at %s", bind_path)
         return True
+
+    async def _bind_first_available(self) -> tuple[Path, Optional[Path]]:
+        """Bind on the first candidate filesystem that accepts a socket.
+
+        LOCAL PATCH (fork, v0.23.2-p9-14): ``bind(2)`` on an AF_UNIX node inside a VirtualBox
+        shared folder answers EPERM, so ``$HERMES_HOME/gateway.sock`` (HERMES_HOME=/opt/data on
+        vboxsf) can never be the primary location — and because that path still fits ``sun_path``
+        upstream's over-long-home fallback never fired, which is the cutover blocker. Candidates
+        come from :func:`control_socket_candidates` (private runtime dir, temp dir, /tmp, then the
+        legacy in-home leaf) and each one that answers "this filesystem cannot host a socket" is
+        skipped, exactly like the loop-tick witness walk. Any other errno still fails loudly —
+        EADDRINUSE keeps a live sibling visible — and when *every* candidate refuses this raises,
+        so ``start()`` returns False and bootstrap stays fatal as upstream intends.
+        Rationale and incident: docs/21-state-db-local-disk.md."""
+        last_error: Optional[OSError] = None
+        for bind_path, pointer_file in control_socket_candidates(self._home):
+            try:
+                return await self._bind_posix(bind_path, pointer_file), pointer_file
+            except OSError as exc:
+                if exc.errno not in _SOCKET_UNSUPPORTED_ERRNOS:
+                    raise
+                logger.debug("Control socket refused at %s (%s); trying the next candidate",
+                             bind_path, exc.strerror or exc)
+                last_error = exc
+        raise last_error or OSError(
+            errno.ENOTSUP, "no candidate filesystem can host the gateway control socket")
+
+    def _unlink_stale_in_home_leaf(self, bind_path: Path) -> None:
+        """Best-effort removal of a stale ``<HERMES_HOME>/gateway.sock`` when listening elsewhere.
+
+        LOCAL PATCH (fork, v0.23.2-p9-14). ``resolve_client_socket_path`` prefers an existing direct
+        path over the pointer, so leaving a node here would make every client dial a dead inode
+        while the listener answers in the runtime directory. We won the PID-file claim, so any node
+        at this name is stale — ``_bind_posix`` relies on the same reasoning. The ownership guard
+        upstream uses cannot be applied: a shared folder reports a *mapped* owner, so on vboxsf a
+        file created by this very process can look foreign. Never fatal; directories are left
+        alone."""
+        legacy = self._home / _SOCKET_FILENAME
+        if bind_path == legacy:
+            return
+        with contextlib.suppress(OSError):
+            if not stat.S_ISDIR(legacy.lstat().st_mode):  # windows-footgun: ok — POSIX
+                legacy.unlink()
+                logger.debug("Removed stale in-home control socket node %s", legacy)
+
+    def _publish_pointer_best_effort(self, pointer_file: Path, bind_path: Path) -> None:
+        """Publish the discovery pointer, never letting it veto a working listener.
+
+        LOCAL PATCH (fork, v0.23.2-p9-14): the pointer is a regular file, so vboxsf hosts it
+        fine, but a read-only or full HERMES_HOME must not turn a bound listener into a fatal
+        bootstrap — the listener is the contract, the pointer is a hint. Failed publishes are
+        logged at debug and the server keeps serving (in-home peers still resolve ``gateway.sock``
+        directly on every non-relocated deployment)."""
+        try:
+            _publish_pointer(pointer_file, bind_path)
+        except OSError as exc:
+            logger.debug("Control socket pointer not published at %s: %s", pointer_file, exc)
+            return
+        self._pointer_file = pointer_file
 
     async def _bind_posix(self, bind_path: Path, pointer_file: Optional[Path]) -> Path:
         """Bind the listener at ``bind_path`` (moved to a squat-proof root when its shared-temp

@@ -12,6 +12,7 @@ import pytest
 from gateway.control_socket import (
     CONTROL_PROTOCOL_VERSION,
     GatewayControlServer,
+    control_socket_candidates,
     identify_gateway,
     query_gateway_control,
     resolve_client_socket_path,
@@ -193,27 +194,32 @@ def test_verb_handler_receives_params(home: Path):
 
 
 def test_stop_removes_socket_and_pointer(home: Path):
+    # LOCAL PATCH (fork): the server binds the first candidate (private runtime dir / temp dir),
+    # not the in-home leaf, so the assertion follows the candidate the server actually used.
+    bind, _ = control_socket_candidates(home.resolve())[0]
+
     async def scenario():
         server = GatewayControlServer(
             home, verb_handlers={"identify": lambda: {"pid": 1}}
         )
         assert await server.start()
-        bind, _ = resolve_server_socket_path(home)
+        assert server._bind_path is not None and server._bind_path == bind
         assert bind.exists()
         await server.stop()
         return bind
 
     bind = _run(scenario())
     assert not bind.exists()
+    assert not (home / "gateway.sock.path").exists()
     assert resolve_client_socket_path(home) is None
     # queries after stop cleanly return None
     assert query_gateway_control(home, "identify") is None
 
 
 def test_stale_socket_file_is_replaced_on_bind(home: Path):
-    # Plant the stale file at wherever the server will actually bind
-    # (in-home OR the temp-dir fallback, depending on path length).
-    bind, _ = resolve_server_socket_path(home)
+    # Plant the stale file at wherever the server will actually bind (fork: the first runtime
+    # candidate, not the in-home leaf).
+    bind, _ = control_socket_candidates(home.resolve())[0]
     bind.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     bind.touch()  # crashed predecessor's leftover
 
@@ -317,16 +323,19 @@ def test_home_refusing_sockets_listens_on_private_fallback_both_clients_reach(sh
 
 def test_bind_refused_for_other_reasons_still_fails(short_home: Path, monkeypatch):
     # A live sibling (EADDRINUSE) must keep failing loudly — no silent fallback
-    # that would let two gateways for one home both look healthy.
+    # that would let two gateways for one home both look healthy. The first candidate is where
+    # the server stops: a non-"this filesystem cannot host a socket" errno is re-raised, so the
+    # walk never reaches the next candidate.
     home = short_home.resolve()  # match the server's resolved home (macOS /tmp -> /private/tmp)
-    attempts = _refusing_start_unix_server(monkeypatch, refuse_under=home, err=errno.EADDRINUSE)
+    first, _ = control_socket_candidates(home)[0]
+    attempts = _refusing_start_unix_server(monkeypatch, refuse_under=Path("/"), err=errno.EADDRINUSE)
 
     async def scenario():
         server = GatewayControlServer(home)
         return await server.start()
 
     assert _run(scenario()) is False
-    assert attempts == [str(home / "gateway.sock")]
+    assert attempts == [str(first)]
     assert not (home / "gateway.sock.path").exists()
 
 
