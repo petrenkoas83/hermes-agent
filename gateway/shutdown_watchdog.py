@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import faulthandler
 import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -44,6 +46,12 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
+# A filesystem that cannot host an AF_UNIX node answers these at bind time: a VirtualBox shared
+# folder (vboxsf) refuses with EPERM, Docker Desktop's virtiofs with EOPNOTSUPP. They mean "this
+# filesystem cannot host a socket", not "the gateway has no witness", so the next runtime candidate
+# is tried. Not EADDRINUSE: a live sibling must keep failing loudly.
+_LOOP_TICK_UNSUPPORTED_ERRNOS = frozenset(
+    {errno.EPERM, errno.EACCES, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
 def _coerce_float(value: Any, default: float, floor: float = 0.0) -> float:
@@ -197,16 +205,95 @@ def get_loop_heartbeat_path(home: Optional[Path] = None) -> Path:
     return _home(home).joinpath(*_HEARTBEAT_RELATIVE)
 
 
-def get_loop_tick_socket_path(home: Optional[Path] = None, pid: Optional[int] = None) -> Path:
-    """``<HERMES_HOME>/state/gateway.loop-tick.<pid>.sock`` — PID-suffixed so a stale node from a
-    dead process is never mistaken for this gateway's witness. Served by the loop itself
-    (``_tick_socket_handler``), so an answer proves the loop dispatches; the heartbeat cannot.
+def loop_tick_socket_candidates(
+    home: Optional[Path] = None, pid: Optional[int] = None
+) -> list[Path]:
+    """Ordered candidate paths for the loop-tick witness socket, best first.
 
-    Served by the gateway loop itself (see ``_tick_socket_handler``): an answer is direct proof that the
-    loop is dispatching, which is exactly the property the heartbeat file lost when its write moved off-loop
-    (#90502).
+    The witness must never live on a shared folder: ``bind(2)`` on VirtualBox vboxsf answers
+    ``EPERM`` (#P3), which would silently disarm the loop-scheduling witness. The upstream control
+    socket already relocated for exactly this reason, so the first candidate reuses its private
+    directory formula — ``$XDG_RUNTIME_DIR/hermes-gw-<hash>/`` with the same ``<hash>`` of
+    ``HERMES_HOME`` — and only the leaf differs (``loop-tick.<pid>.sock`` vs ``control.sock``).
+    Then ``tempfile.gettempdir()`` (created ``0700`` by the caller), then ``/tmp``, and the legacy
+    ``<HERMES_HOME>/state/gateway.loop-tick.<pid>.sock`` only as the last resort for hosts with no
+    usable runtime directory. Only candidates that fit ``sun_path`` are returned; an empty list
+    means AF_UNIX is unusable here and the caller must arm the TCP-loopback witness instead.
+    """
+    # Reuse the upstream helpers rather than copying the control-socket relocation code.
+    from gateway.control_socket import _fits_sun_path, _home_hash, _private_runtime_dir
+
+    pid = int(pid if pid is not None else os.getpid())
+    name = Path(f"hermes-gw-{_home_hash(_home(home))}") / f"loop-tick.{pid}.sock"
+    runtime = _private_runtime_dir()
+    candidates: list[Path] = [runtime / name] if runtime is not None else []
+    candidates.append(Path(tempfile.gettempdir()) / name)
+    if os.name != "nt":  # no-tmp: ok — the short /tmp root keeps AF_UNIX under the sun_path limit
+        candidates.append(Path("/tmp") / name)
+    candidates.append(_home(home) / "state" / f"gateway.loop-tick.{pid}.sock")
+    unique: list[Path] = []  # tempfile.gettempdir() is usually /tmp itself
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return [candidate for candidate in unique if _fits_sun_path(candidate)]
+
+
+def _published_tick_socket_path(home: Path, pid: int) -> Optional[Path]:
+    """The witness path a running gateway published in its heartbeat, if it did.
+
+    Path derivation alone cannot align a probe with the producer: a daemon started without
+    ``$XDG_RUNTIME_DIR`` (or with the scratch ``TMPDIR`` redirect pointing into ``HERMES_HOME``)
+    binds under a different root than the CLI that probes it. The heartbeat is the one place both
+    processes agree on, so the producer publishes the path it actually bound and the probe trusts it
+    — the same "pointer" role ``gateway.sock.path`` plays for the control socket. Best-effort and
+    read-only: any error or mismatch means "nothing published". The leaf must still be this PID's
+    witness name, so a stale or foreign payload cannot point the probe at an arbitrary node.
+    """
+    try:
+        payload = json.loads(get_loop_heartbeat_path(home).read_text(encoding="utf-8-sig"))
+        if int(payload.get("pid") or 0) != int(pid):
+            return None
+        raw = payload.get("loop_tick_socket_path")
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(raw, str) or not raw:
+        return None
+    candidate = Path(raw)
+    if not candidate.is_absolute() or not candidate.name.endswith(f"loop-tick.{pid}.sock"):
+        return None
+    return candidate
+
+
+def get_loop_tick_socket_path(home: Optional[Path] = None, pid: Optional[int] = None) -> Path:
+    """Preferred witness path — the first candidate from ``loop_tick_socket_candidates``.
+
+    PID-suffixed so a stale node from a dead process is never mistaken for this gateway's witness.
+    Served by the loop itself (``_tick_socket_handler``), so an answer proves the loop dispatches;
+    the heartbeat cannot (#90502). The producer binds the first candidate its filesystem accepts and
+    the consumer (the ``hermes_cli.gateway`` liveness probe) resolves the same deterministic path,
+    so both sides agree without a pointer file; a pointer would have to live on the shared folder
+    and is therefore not published.
+
+    Falls back to the legacy ``<HERMES_HOME>/state/gateway.loop-tick.<pid>.sock`` when no runtime
+    candidate fits ``sun_path``.
+
+    A probe may run in a process provisioned differently from the gateway (a daemon started without
+    ``$XDG_RUNTIME_DIR`` binds under the temp directory while the CLI has one), so resolution goes
+    through, in order: the path the running gateway published in its heartbeat
+    (``_published_tick_socket_path`` — authoritative), an already-bound candidate (the pid-suffixed
+    node can only exist where the producer bound it), then the env-derived preference.
     """
     pid = int(pid if pid is not None else os.getpid())
+    published = _published_tick_socket_path(_home(home), pid)
+    if published is not None:
+        return published
+    candidates = loop_tick_socket_candidates(home, pid)
+    for candidate in candidates:
+        with contextlib.suppress(OSError):  # an un-stat-able node is absent, not an error
+            if candidate.exists():
+                return candidate
+    if candidates:
+        return candidates[0]
     return _home(home) / "state" / f"gateway.loop-tick.{pid}.sock"
 
 
@@ -373,15 +460,45 @@ def _sweep_stale_tick_sockets(own_path: Path) -> None:
     """Unlink loop-tick socket nodes left by dead PIDs (POSIX only; never raises).
     create_unix_server removes a leftover node at OUR path (os._exit / SIGKILL skip the
     finally-unlink) but not SIBLING nodes from other dead PIDs. os.kill(pid, 0) is a liveness
-    probe only on POSIX (Windows would TerminateProcess)."""
+    probe only on POSIX (Windows would TerminateProcess). The glob matches both the runtime leaf
+    (``loop-tick.<pid>.sock``) and the legacy ``gateway.loop-tick.<pid>.sock``."""
     try:
-        for stale in (p for p in own_path.parent.glob("gateway.loop-tick.*.sock") if p != own_path):
+        for stale in (p for p in own_path.parent.glob("*loop-tick.*.sock") if p != own_path):
             try:
                 os.kill(int(stale.name.split(".")[-2]), 0)  # windows-footgun: ok — POSIX-only
             except (ValueError, IndexError, OSError):
                 stale.unlink(missing_ok=True)
     except Exception:
         logger.debug("stale loop-tick socket sweep failed", exc_info=True)
+
+
+async def _start_tick_unix_server(
+    home: Optional[Path] = None,
+) -> tuple[Path, asyncio.AbstractServer]:
+    """Bind the loop-tick witness on the first candidate filesystem that accepts a socket.
+
+    A shared folder (vboxsf) answers ``EPERM`` to ``bind(2)`` and Docker Desktop's virtiofs answers
+    ``EOPNOTSUPP``: those mean "this filesystem cannot host a socket", so the next runtime candidate
+    is tried instead of disarming the witness. Any other error is re-raised for the caller's single
+    non-fatal warning. Returns ``(bind_path, server)``."""
+    last_error: Optional[OSError] = None
+    for candidate in loop_tick_socket_candidates(home):
+        try:
+            candidate.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _sweep_stale_tick_sockets(candidate)
+            server = await asyncio.start_unix_server(_tick_socket_handler, path=str(candidate))
+        except OSError as exc:
+            if exc.errno not in _LOOP_TICK_UNSUPPORTED_ERRNOS:
+                raise
+            logger.debug("Loop-tick socket refused at %s (%s); trying the next runtime candidate",
+                         candidate, exc.strerror or exc)
+            last_error = exc
+            continue
+        with contextlib.suppress(OSError):
+            os.chmod(candidate, 0o600)
+        return candidate, server
+    raise last_error or OSError(
+        errno.ENOTSUP, "no runtime candidate can host the loop-tick socket")
 
 
 async def loop_heartbeat_forever(
@@ -397,19 +514,14 @@ async def loop_heartbeat_forever(
     loop-scheduling witness (``_tick_socket_handler``, flagged as ``loop_tick_socket``); probes must
     require the witness to agree before classifying WEDGED."""
     interval = _coerce_float(interval_s, DEFAULT_HEARTBEAT_INTERVAL_S, floor=1.0)
-    # The witness exposes only a scheduling ping, not control/auth operations. Reuse its
-    # loopback transport when AF_UNIX is unavailable or the encoded address will not fit;
-    # consumers already discover this port in the heartbeat, independent of their TMPDIR.
-    from gateway.control_socket import _fits_sun_path
+    # The witness exposes only a scheduling ping, not control/auth operations. It lives in the
+    # private runtime directory (never on the shared folder: bind(2) there answers EPERM); the TCP
+    # loopback transport is used only when no AF_UNIX candidate fits sun_path. Consumers already
+    # discover the port in the heartbeat, independent of their TMPDIR.
     tick_server = tick_socket_path = tick_tcp_port = None
     try:
-        unix_path = get_loop_tick_socket_path(home) if os.name == "posix" else None
-        if unix_path is not None and _fits_sun_path(unix_path):
-            tick_socket_path = unix_path
-            tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
-            _sweep_stale_tick_sockets(tick_socket_path)
-            tick_server = await asyncio.start_unix_server(_tick_socket_handler,
-                                                          path=str(tick_socket_path))
+        if os.name == "posix" and loop_tick_socket_candidates(home):
+            tick_socket_path, tick_server = await _start_tick_unix_server(home)
         else:
             tick_server = await asyncio.start_server(_tick_socket_handler, host="127.0.0.1", port=0)
             for _s in tick_server.sockets or []:
@@ -418,11 +530,14 @@ async def loop_heartbeat_forever(
                         tick_tcp_port = int(_sname[1])
                         break
     except Exception:
-        tick_server = tick_tcp_port = None
+        tick_server = tick_socket_path = tick_tcp_port = None
         logger.warning("Loop tick socket unavailable — liveness probes will have no "
                        "loop-scheduling witness and will not escalate on a stale heartbeat",
                        exc_info=True)
-    extra = {"loop_tick_socket": tick_server is not None, "loop_tick_tcp_port": tick_tcp_port}
+    extra: dict[str, Any] = {"loop_tick_socket": tick_server is not None,
+                             "loop_tick_tcp_port": tick_tcp_port}
+    if tick_socket_path is not None:  # diagnostics only; consumers resolve the same path themselves
+        extra["loop_tick_socket_path"] = str(tick_socket_path)
     try:
         while True:  # first write is immediate so monitors see a fresh file at once
             try:
